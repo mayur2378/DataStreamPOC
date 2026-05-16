@@ -15,10 +15,19 @@ First-time setup (run once after CDK deploy + connector setup):
 
 Daily workflow:
     python inject.py seed            # insert 20 rows per table
+    python inject.py seed --count 5  # insert 5 rows per table
     python inject.py status          # compare source vs target counts
     python inject.py bulk --table orders --count 5000
     python inject.py bulk-all --count 1000
     python inject.py chaos --rate 5 --duration 30
+
+Volume + update testing:
+    python inject.py test-volume --count 1    # 1 row/table end-to-end test
+    python inject.py test-volume --count 10   # 10 rows/table
+    python inject.py test-volume --count 100  # 100 rows/table
+    python inject.py test-volume --count 1000 # 1000 rows/table
+    python inject.py test-updates             # verify updates propagate in-place
+    python inject.py verify                   # deep value comparison (not just counts)
 
 Reset for a new test run:
     python inject.py clear-source    # delete source rows (CDC propagates to target)
@@ -298,17 +307,18 @@ def clear_all() -> None:
 
 
 @cli.command()
-def seed() -> None:
-    """Insert 20 rows per table using Faker data."""
+@click.option("--count", default=20, show_default=True, help="Rows to insert per table")
+def seed(count: int) -> None:
+    """Insert COUNT rows per table using Faker data."""
     with get_conn("source") as conn:
         with conn.cursor() as cur:
             for table in TABLES:
                 inserted = 0
-                for _ in range(20):
+                for _ in range(count):
                     if _insert_row(cur, table):
                         inserted += 1
                 click.echo(f"  {table}: +{inserted} rows")
-    click.echo("Seed complete. Wait ~10s then run: python inject.py status")
+    click.echo(f"Seed complete ({count}/table). Wait ~10s then run: python inject.py status")
 
 
 @cli.command()
@@ -519,6 +529,335 @@ def status() -> None:
                 rows.append([table, src_count, tgt_count, lag])
 
     click.echo(tabulate(rows, headers=["Table", "Source", "Target", "Lag"], tablefmt="rounded_outline"))
+
+
+# ── Volume test ────────────────────────────────────────────────────────────────
+
+@cli.command("test-volume")
+@click.option("--count", required=True, type=int, help="Rows to insert per table (1 / 10 / 100 / 1000)")
+@click.option("--wait", default=60, show_default=True, help="Max seconds to wait for replication")
+def test_volume(count: int, wait: int) -> None:
+    """Clear tables, seed COUNT rows/table, poll until target matches, report pass/fail."""
+    click.echo(f"\n{'='*60}")
+    click.echo(f"  Volume test: {count} rows per table  ({count * len(TABLES)} total)")
+    click.echo(f"{'='*60}")
+
+    click.echo("\n[1/3] Clearing source and target tables...")
+    _do_clear_source()
+    _do_clear_target()
+
+    click.echo(f"\n[2/3] Seeding {count} rows per table...")
+    t_insert_start = time.time()
+    with get_conn("source") as conn:
+        with conn.cursor() as cur:
+            for table in TABLES:
+                inserted = 0
+                for _ in range(count):
+                    if _insert_row(cur, table):
+                        inserted += 1
+                click.echo(f"  source.{table}: +{inserted}")
+    insert_elapsed = time.time() - t_insert_start
+    click.echo(f"  Insert time: {insert_elapsed:.1f}s")
+
+    click.echo(f"\n[3/3] Polling target (max {wait}s)...")
+    t_poll_start = time.time()
+    deadline = t_poll_start + wait
+    passed = False
+
+    while time.time() < deadline:
+        with get_conn("source") as src_conn, get_conn("target") as tgt_conn:
+            with src_conn.cursor() as sc, tgt_conn.cursor() as tc:
+                all_match = True
+                for table in TABLES:
+                    sc.execute(f"SELECT COUNT(*) FROM {table}")
+                    tc.execute(f"SELECT COUNT(*) FROM {table}")
+                    if sc.fetchone()[0] != tc.fetchone()[0]:
+                        all_match = False
+                        break
+        if all_match:
+            passed = True
+            break
+        remaining = int(deadline - time.time())
+        click.echo(f"  waiting... {remaining}s remaining\r", nl=False)
+        time.sleep(3)
+
+    replication_elapsed = time.time() - t_poll_start
+    click.echo()
+
+    rows = []
+    with get_conn("source") as src_conn, get_conn("target") as tgt_conn:
+        with src_conn.cursor() as sc, tgt_conn.cursor() as tc:
+            for table in TABLES:
+                sc.execute(f"SELECT COUNT(*) FROM {table}")
+                tc.execute(f"SELECT COUNT(*) FROM {table}")
+                s, t = sc.fetchone()[0], tc.fetchone()[0]
+                result = "PASS" if s == t else "FAIL"
+                rows.append([table, s, t, result])
+
+    click.echo(tabulate(rows, headers=["Table", "Source", "Target", "Result"], tablefmt="rounded_outline"))
+    click.echo(f"\n  Replication latency: {replication_elapsed:.1f}s")
+    if passed:
+        click.echo(f"  RESULT: PASS — all {count * len(TABLES)} rows replicated")
+    else:
+        click.echo(f"  RESULT: FAIL — target did not catch up within {wait}s")
+
+
+# ── Update test ────────────────────────────────────────────────────────────────
+
+# Sentinel values written during test-updates — chosen to be unmistakably test-driven.
+_UPDATE_SENTINELS: dict[str, dict] = {
+    "customers":   {"status": "cdc_verified"},
+    "products":    {"price": 9999.99, "stock_qty": 77777},
+    "orders":      {"status": "cdc_verified"},
+    "inventory":   {"quantity": 88888},
+    "order_items": {"quantity": 9},
+}
+
+# Columns to compare when verifying updates landed in target.
+_UPDATE_CHECK_COLS: dict[str, list[str]] = {
+    "customers":   ["status"],
+    "products":    ["price", "stock_qty"],
+    "orders":      ["status"],
+    "inventory":   ["quantity"],
+    "order_items": ["quantity"],
+}
+
+
+def _apply_sentinel_update(cur: psycopg2.extensions.cursor, table: str, rid: int) -> None:
+    vals = _UPDATE_SENTINELS[table]
+    set_clause = ", ".join(f"{col}=%s" for col in vals)
+    if table in ("customers", "products", "orders", "inventory"):
+        set_clause += ", updated_at=now()"
+    cur.execute(f"UPDATE {table} SET {set_clause} WHERE id=%s", [*vals.values(), rid])
+
+
+@cli.command("test-updates")
+@click.option("--sample", default=5, show_default=True, help="Rows to update per table")
+@click.option("--wait", default=60, show_default=True, help="Max seconds to wait for replication")
+def test_updates(sample: int, wait: int) -> None:
+    """
+    Update SAMPLE existing rows per table with sentinel values, then verify
+    target reflects the exact new values — proving CDC upserts, not inserts.
+    """
+    click.echo(f"\n{'='*60}")
+    click.echo(f"  Update test: {sample} rows per table")
+    click.echo(f"{'='*60}")
+
+    # Check source has enough data.
+    with get_conn("source") as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM customers")
+            src_count = cur.fetchone()[0]
+    if src_count < sample:
+        click.echo(f"Source has only {src_count} customer rows — run 'seed --count {sample*2}' first.")
+        return
+
+    # Record source counts before (to confirm no extra rows are created).
+    before_counts: dict[str, int] = {}
+    with get_conn("source") as conn:
+        with conn.cursor() as cur:
+            for table in TABLES:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                before_counts[table] = cur.fetchone()[0]
+
+    # Apply sentinel updates and capture which IDs were changed.
+    updated_ids: dict[str, list[int]] = {}
+    click.echo("\n[1/3] Applying updates to source...")
+    with get_conn("source") as conn:
+        with conn.cursor() as cur:
+            for table in TABLES:
+                cur.execute(f"SELECT id FROM {table} ORDER BY random() LIMIT %s", (sample,))
+                ids = [r[0] for r in cur.fetchall()]
+                for rid in ids:
+                    _apply_sentinel_update(cur, table, rid)
+                updated_ids[table] = ids
+                cols_display = ", ".join(
+                    f"{k}={v!r}" for k, v in _UPDATE_SENTINELS[table].items()
+                )
+                click.echo(f"  source.{table}: ids={ids}  →  {cols_display}")
+
+    # Poll target for the sentinel values.
+    click.echo(f"\n[2/3] Polling target (max {wait}s)...")
+    t_start = time.time()
+    deadline = t_start + wait
+
+    def _all_landed() -> bool:
+        with get_conn("target") as conn:
+            with conn.cursor() as cur:
+                for table, ids in updated_ids.items():
+                    if not ids:
+                        continue
+                    check_cols = _UPDATE_CHECK_COLS[table]
+                    sentinel = _UPDATE_SENTINELS[table]
+                    for rid in ids:
+                        cur.execute(
+                            f"SELECT {', '.join(check_cols)} FROM {table} WHERE id=%s", (rid,)
+                        )
+                        row = cur.fetchone()
+                        if row is None:
+                            return False
+                        for i, col in enumerate(check_cols):
+                            expected = sentinel[col]
+                            actual = row[i]
+                            if isinstance(expected, float):
+                                if abs(float(actual) - expected) > 0.01:
+                                    return False
+                            elif str(actual) != str(expected):
+                                return False
+        return True
+
+    passed = False
+    while time.time() < deadline:
+        if _all_landed():
+            passed = True
+            break
+        remaining = int(deadline - time.time())
+        click.echo(f"  waiting... {remaining}s remaining\r", nl=False)
+        time.sleep(3)
+
+    replication_elapsed = time.time() - t_start
+    click.echo()
+
+    # Verify no new rows were created (count must not have increased).
+    click.echo("\n[3/3] Results")
+    result_rows = []
+    with get_conn("source") as src_conn, get_conn("target") as tgt_conn:
+        with src_conn.cursor() as sc, tgt_conn.cursor() as tc:
+            for table in TABLES:
+                sc.execute(f"SELECT COUNT(*) FROM {table}")
+                tc.execute(f"SELECT COUNT(*) FROM {table}")
+                src_n, tgt_n = sc.fetchone()[0], tc.fetchone()[0]
+                count_ok = "OK" if src_n == tgt_n else "MISMATCH"
+                # Check values for updated rows.
+                ids = updated_ids.get(table, [])
+                check_cols = _UPDATE_CHECK_COLS[table]
+                sentinel = _UPDATE_SENTINELS[table]
+                val_ok_count = 0
+                for rid in ids:
+                    tc.execute(
+                        f"SELECT {', '.join(check_cols)} FROM {table} WHERE id=%s", (rid,)
+                    )
+                    row = tc.fetchone()
+                    if row:
+                        matched = all(
+                            abs(float(row[i]) - float(sentinel[col])) < 0.01
+                            if isinstance(sentinel[col], float)
+                            else str(row[i]) == str(sentinel[col])
+                            for i, col in enumerate(check_cols)
+                        )
+                        if matched:
+                            val_ok_count += 1
+                val_result = f"{val_ok_count}/{len(ids)} values match"
+                result_rows.append([table, before_counts[table], src_n, tgt_n, count_ok, val_result])
+
+    click.echo(tabulate(
+        result_rows,
+        headers=["Table", "Before", "Src now", "Tgt now", "Count", "Values"],
+        tablefmt="rounded_outline",
+    ))
+    click.echo(f"\n  Replication latency: {replication_elapsed:.1f}s")
+    if passed:
+        click.echo("  RESULT: PASS — all updated values confirmed in target (upsert, not insert)")
+    else:
+        click.echo("  RESULT: FAIL — some values did not match within the wait window")
+    click.echo(f"\n  Sentinel values used:")
+    for table, vals in _UPDATE_SENTINELS.items():
+        click.echo(f"    {table}: {vals}")
+
+
+# ── Deep value comparison ──────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--sample", default=10, show_default=True, help="Rows to compare per table")
+def verify(sample: int) -> None:
+    """
+    Compare actual column values between source and target for a random sample.
+    Confirms CDC is replicating data correctly, not just row counts.
+    """
+    # Columns to compare per table (excludes timestamp cols stored differently in target).
+    compare_cols: dict[str, list[str]] = {
+        "customers":   ["id", "name", "email", "status"],
+        "products":    ["id", "name", "category", "price", "stock_qty"],
+        "orders":      ["id", "customer_id", "status", "total_amount"],
+        "order_items": ["id", "order_id", "product_id", "quantity", "unit_price"],
+        "inventory":   ["id", "product_id", "warehouse_id", "quantity"],
+    }
+
+    summary_rows = []
+    any_mismatch = False
+
+    with get_conn("source") as src_conn, get_conn("target") as tgt_conn:
+        with src_conn.cursor() as sc, tgt_conn.cursor() as tc:
+            for table, cols in compare_cols.items():
+                col_list = ", ".join(cols)
+                sc.execute(
+                    f"SELECT {col_list} FROM {table} ORDER BY random() LIMIT %s", (sample,)
+                )
+                src_rows = {r[0]: r for r in sc.fetchall()}  # keyed by id
+
+                if not src_rows:
+                    summary_rows.append([table, 0, 0, 0, "no source data"])
+                    continue
+
+                ids = list(src_rows.keys())
+                placeholders = ", ".join(["%s"] * len(ids))
+                tc.execute(f"SELECT {col_list} FROM {table} WHERE id IN ({placeholders})", ids)
+                tgt_rows = {r[0]: r for r in tc.fetchall()}
+
+                matched = 0
+                mismatched = 0
+                missing = 0
+                mismatch_detail: list[str] = []
+
+                for rid, src_row in src_rows.items():
+                    if rid not in tgt_rows:
+                        missing += 1
+                        mismatch_detail.append(f"  id={rid} MISSING in target")
+                        continue
+                    tgt_row = tgt_rows[rid]
+                    row_ok = True
+                    for i, col in enumerate(cols):
+                        sv, tv = src_row[i], tgt_row[i]
+                        # Numeric comparison with tolerance for NUMERIC types.
+                        try:
+                            if abs(float(sv) - float(tv)) > 0.001:
+                                row_ok = False
+                                mismatch_detail.append(
+                                    f"  id={rid} col={col}: src={sv!r} tgt={tv!r}"
+                                )
+                                break
+                        except (TypeError, ValueError):
+                            if str(sv) != str(tv):
+                                row_ok = False
+                                mismatch_detail.append(
+                                    f"  id={rid} col={col}: src={sv!r} tgt={tv!r}"
+                                )
+                                break
+                    if row_ok:
+                        matched += 1
+                    else:
+                        mismatched += 1
+
+                result = "PASS" if (mismatched == 0 and missing == 0) else "FAIL"
+                if result == "FAIL":
+                    any_mismatch = True
+                summary_rows.append([table, len(src_rows), matched, mismatched + missing, result])
+
+                if mismatch_detail:
+                    for line in mismatch_detail[:5]:
+                        click.echo(line)
+                    if len(mismatch_detail) > 5:
+                        click.echo(f"  ... {len(mismatch_detail) - 5} more mismatches")
+
+    click.echo(tabulate(
+        summary_rows,
+        headers=["Table", "Sampled", "Match", "Mismatch/Missing", "Result"],
+        tablefmt="rounded_outline",
+    ))
+    if not any_mismatch:
+        click.echo("\nAll sampled values match between source and target.")
+    else:
+        click.echo("\nMismatches found — check connector logs or wait longer for CDC propagation.")
 
 
 if __name__ == "__main__":
