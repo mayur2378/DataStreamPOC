@@ -1,0 +1,28 @@
+# CDK build output and dependencies
+cdk/node_modules/
+cdk/cdk.out/
+
+# CDK context contains AWS account ID — regenerated automatically on deploy
+cdk/cdk.context.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+
+# AWS outputs file with live endpoints and secret ARNs
+Outputs-AWS Parms.txt
+
+# Claude memory
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
